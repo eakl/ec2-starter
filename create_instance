@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+
+# -----------------------
+# Variables and functions
+# -----------------------
+
+# Directories
+EC2_STARTER_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+WORKING_DIR="$( pwd )"
+AWS_CONFIG_DIR="${CONFIG}/aws"
+
+# Files
+CONFIG_FILE=".aws"
+EC2_LOCAL_CONFIG_FILE="${WORKING_DIR}/${CONFIG_FILE}"
+EC2_INSTANCE_FILE="${WORKING_DIR}/instance"
+
+# ------------------
+# Load configuration
+# ------------------
+
+source ${EC2_LOCAL_CONFIG_FILE} || { echo "Missing config file"; exit 1; }
+
+[[ -z "$EC2_NAME" ]] && { echo "EC2_NAME is missing."; exit 1; }
+[[ -z "$EC2_REGION" ]] && { echo "EC2_REGION is missing."; exit 1; }
+
+[[ -z "$EC2_VPC_ID" ]] && { echo "EC2_VPC_ID is missing."; exit 1; }
+[[ -z "$EC2_SUBNET_ID" ]] && { echo "EC2_SUBNET_ID is missing."; exit 1; }
+[[ -z "$EC2_INTERNET_GATEWAY_ID" ]] && { echo "EC2_INTERNET_GATEWAY_ID is missing."; exit 1; }
+[[ -z "$EC2_ROUTE_TABLE_ID" ]] && { echo "EC2_ROUTE_TABLE_ID is missing."; exit 1; }
+[[ -z "$EC2_ROUTE_TABLE_ASSOC" ]] && { echo "EC2_ROUTE_TABLE_ASSOC is missing."; exit 1; }
+[[ -z "$EC2_SECURITY_GROUP_ID" ]] && { echo "EC2_SECURITY_GROUP_ID is missing."; exit 1; }
+
+[[ -z "$EC2_INSTANCE_TYPE" ]] && { echo "EC2_INSTANCE_TYPE is missing."; exit 1; }
+[[ -z "$EC2_IMAGE_ID" ]] && { echo "EC2_IMAGE_ID is missing."; exit 1; }
+
+[[ -z "$EC2_KEY_PAIR" ]] && { echo "EC2_KEY_PAIR is missing."; exit 1; }
+
+if [[ "$EC2_VOLUME_SIZE" -gt 0 ]]; then
+  [[ -z "$EC2_VOLUME_NAME" ]] && { echo "EC2_VOLUME_NAME is missing."; exit 1; }
+  [[ -z "$EC2_DEVICE_NAME" ]] && { echo "EC2_DEVICE_NAME is missing."; exit 1; }
+  [[ -z "$EC2_VOLUME_TYPE" ]] && { echo "EC2_VOLUME_TYPE is missing."; exit 1; }
+  [[ -z "$EC2_VOLUME_DELETE" ]] && { echo "EC2_VOLUME_DELETE is missing."; exit 1; }
+  vol_opts="--block-device-mapping \"[ { \"VirtualName\": \"${EC2_VOLUME_NAME}\", \"DeviceName\": \"${EC2_DEVICE_NAME}\", \"Ebs\": { \"VolumeSize\": ${EC2_VOLUME_SIZE}, \"VolumeType\": \"${EC2_VOLUME_TYPE}\", \"DeleteOnTermination\": ${EC2_VOLUME_DELETE} } } ]\""
+else
+  vol_opts=""
+fi;
+
+if [[ -n "$EC2_USER_DATA" ]]; then
+  user_data="--user-data file://${EC2_USER_DATA}"
+else
+  user_data=""
+fi;
+
+# -----------------------
+# Validating the instance
+# -----------------------
+
+cat <<EOF
+This instance will be created:
+
+Name.............: ${EC2_NAME}
+Region...........: ${EC2_REGION}
+Instance Type....: ${EC2_INSTANCE_TYPE}
+Image Id.........: ${EC2_IMAGE_ID}
+
+Volume Name......: ${EC2_VOLUME_NAME}
+Device Name......: ${EC2_DEVICE_NAME}
+Volume Size......: ${EC2_VOLUME_SIZE}
+Volume Type......: ${EC2_VOLUME_TYPE}
+Delete Volume....: ${EC2_VOLUME_DELETE}
+
+User Data........: ${EC2_USER_DATA}
+
+EOF
+
+# User input validation
+read -p "Do you want to continue? (y/n [n]) " -r
+
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+  echo "Aborted";
+  exit 0;
+fi;
+
+# ---------------------
+# Creating the instance
+# ---------------------
+
+echo "Creating the instance from ${CONFIG_FILE}...";
+
+export instanceId=$(aws --region "$EC2_REGION" ec2 run-instances --image-id "$EC2_IMAGE_ID" --count 1 --instance-type "$EC2_INSTANCE_TYPE" --key-name "$EC2_KEY_PAIR" --security-group-ids "$EC2_SECURITY_GROUP_ID" --subnet-id "$EC2_SUBNET_ID" ${user_data} --associate-public-ip-address ${vol_opts} --query 'Instances[0].InstanceId' --output text)
+aws --region "$EC2_REGION" ec2 create-tags --resources "$instanceId" --tags --tags Key=Name,Value="${EC2_NAME}-instance${is_size}${is_data}${is_del}"
+export allocAddr=$(aws --region "$EC2_REGION" ec2 allocate-address --domain vpc --query 'AllocationId' --output text)
+
+echo "Waiting for instance to start..."
+aws --region "$EC2_REGION" ec2 wait instance-running --instance-ids "$instanceId"
+sleep 10 # wait for ssh service to start running too
+export assocId=$(aws --region "$EC2_REGION" ec2 associate-address --instance-id "$instanceId" --allocation-id "$allocAddr" --query 'AssociationId' --output text)
+export instanceUrl=$(aws --region "$EC2_REGION" ec2 describe-instances --instance-ids "$instanceId" --query 'Reservations[0].Instances[0].PublicDnsName' --output text)
+#export ebsVolume=$(aws ec2 describe-instance-attribute --instance-id $instanceId --attribute  blockDeviceMapping --query BlockDeviceMappings[0].Ebs.VolumeId --output text)
+
+# -----------------------
+# Create the instance CLI
+# -----------------------
+
+echo "Generating the 'instance' script..."
+
+cat > $EC2_INSTANCE_FILE <<EOL
+#!/usr/bin/env bash
+
+# Binaries
+BIN_NAME="\$( basename "\$0" )"
+
+# Directory
+WORKING_DIR="\$( pwd )"
+
+# Files
+EC2_LOCAL_CONFIG_FILE="\${WORKING_DIR}/${CONFIG_FILE}"
+
+# Functions
+error() {
+  echo "error: \$1"
+  echo "To get help, run --help"
+  exit 1;
+}
+
+help_opt() {
+  echo -e "usage: \$BIN_NAME <command>"
+  echo
+  echo -e "commands:"
+  echo -e "   help                            Get help"
+  echo -e "   show                            Show instance information"
+  echo -e "   connect                         Connect to the instance"
+  echo -e "   upload    <local>   <remote>    Upload from local source to remote destination"
+  echo -e "   download  <remote>  <local>     Download from remote source to local destination"
+  echo -e "   start                           Start the instance"
+  echo -e "   stop                            Stop the instance"
+  echo -e "   reboot                          Reboot the instance"
+  echo -e "   delete                          Delete the instance"
+  echo
+}
+
+if [[ \$# -eq 0 ]]; then
+  help_opt;
+  exit 0;
+else
+  case \$1 in
+    help)
+      help_opt;
+      exit 0;
+      ;;
+    show)
+      shift;
+      if [[ \$# -eq 0 ]]; then
+        source \${EC2_LOCAL_CONFIG_FILE} || { echo "Missing config file"; exit 1; }
+
+        echo
+        echo "Instance"
+        echo "--------"
+        echo "Name....................: \${EC2_NAME}"
+        echo "Region..................: \${EC2_REGION}"
+        echo "Type....................: \${EC2_INSTANCE_TYPE}"
+        echo "Image id................: \${EC2_IMAGE_ID}"
+        echo "Startup script..........: \${EC2_USER_DATA}"
+        echo "URL.....................: \${EC2_INSTANCE_URL}"
+        echo
+        echo "Volume"
+        echo "--------"
+        echo "Name....................: \${EC2_VOLUME_NAME}"
+        echo "Device..................: \${EC2_DEVICE_NAME}"
+        echo "Size....................: \${EC2_VOLUME_SIZE}"
+        echo "Type....................: \${EC2_VOLUME_TYPE}"
+        echo "Delete on termination...: \${EC2_VOLUME_DELETE}"
+        echo
+        echo "VPC"
+        echo "--------"
+        echo "VPC.....................: \${EC2_VPC_ID}"
+        echo "Subnet..................: \${EC2_SUBNET_ID}"
+        echo "Internet gateway........: \${EC2_INTERNET_GATEWAY_ID}"
+        echo "Route table.............: \${EC2_ROUTE_TABLE_ID}"
+        echo "Route table assoc.......: \${EC2_ROUTE_TABLE_ASSOC}"
+        echo "Security group..........: \${EC2_SECURITY_GROUP_ID}"
+        echo
+        echo "Keypair"
+        echo "--------"
+        echo "Key pair................: \${EC2_KEY_PAIR}"
+        echo
+
+      else
+        error "wrong number of arguments"
+      fi;
+      ;;
+    connect)
+      shift;
+      if [[ \$# -eq 0 ]]; then
+        echo "Connecting to: ${instanceUrl}";
+        ssh -i "${AWS_CONFIG_DIR}/${EC2_KEY_PAIR}.pem" ubuntu@${instanceUrl}
+      else
+        error "wrong number of arguments"
+      fi;
+      ;;
+    upload)
+      shift;
+      if [[ \$# -eq 2 ]]; then
+        local_path=\$( echo "\$1" | sed 's|^'"\$HOME"'|~|' )
+        remote_path=\$( echo "\$2" | sed 's|^'"\$HOME"'|~|' )
+        if [[ -d "\$local_path" ]]; then
+          scp -i "${AWS_CONFIG_DIR}/${EC2_KEY_PAIR}.pem" -r "\$local_path" ubuntu@${instanceUrl}:\${remote_path}
+        elif [[ -f "\$local_path" ]]; then
+          scp -i "${AWS_CONFIG_DIR}/${EC2_KEY_PAIR}.pem" "\$local_path" ubuntu@${instanceUrl}:\${remote_path}
+        else
+          error "local path does not exist"
+        fi;
+      else
+        error "wrong number of arguments"
+      fi;
+      ;;
+    download)
+      shift;
+      if [[ \$# -eq 2 ]]; then
+        remote_path=\$( echo "\$1" | sed 's|^'"\$HOME"'|~|' )
+        local_path=\$( echo "\$2" | sed 's|^'"\$HOME"'|~|' )
+        if [[ -d "\$local_path" ]]; then
+          scp -i "${AWS_CONFIG_DIR}/${EC2_KEY_PAIR}.pem" -r ubuntu@${instanceUrl}:\${remote_path} "\$local_path"
+        elif [[ -f "\$local_path" ]]; then
+          scp -i "${AWS_CONFIG_DIR}/${EC2_KEY_PAIR}.pem" ubuntu@${instanceUrl}:\${remote_path} "\$local_path"
+        else
+          error "local path does not exist"
+        fi;
+      else
+        error "wrong number of arguments"
+      fi;
+      ;;
+    start)
+      shift;
+      if [[ \$# -eq 0 ]]; then
+        echo "Starting instance: ${instanceId}";
+        aws ec2 start-instances --instance-ids ${instanceId}
+      else
+        error "wrong number of arguments"
+      fi;
+      ;;
+    stop)
+      shift;
+      if [[ \$# -eq 0 ]]; then
+        echo "Stopping instance: ${instanceId}";
+        aws ec2 stop-instances --instance-ids ${instanceId}
+      else
+        error "wrong number of arguments"
+      fi;
+      ;;
+    reboot)
+      shift;
+      if [[ \$# -eq 0 ]]; then
+        echo "Rebooting instance: ${instanceId}";
+        aws ec2 reboot-instances --instance-ids ${instanceId}
+      else
+        error "wrong number of arguments"
+      fi;
+      ;;
+    delete)
+      shift;
+      if [[ \$# -eq 0 ]]; then
+        read -p "The instance '${instanceId}' will be deleted. Do you want to continue? (y/n [n]) " -r
+
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+          echo "Aborted";
+          exit 0;
+        fi;
+
+        echo "Deleting instance's address...";
+        aws --region "$EC2_REGION" ec2 disassociate-address --association-id "$assocId"
+        aws --region "$EC2_REGION" ec2 release-address --allocation-id "$allocAddr"
+
+        echo "Terminating instance: ${instanceId}";
+        echo "(terminated instance are automatically deleted. Volume gets deleted with the instance automatically)";
+        aws --region "$EC2_REGION" ec2 terminate-instances --instance-ids "$instanceId"
+        aws --region "$EC2_REGION" ec2 wait instance-terminated --instance-ids "$instanceId"
+
+        rmtrash ${EC2_INSTANCE_FILE}
+      else
+        error "wrong number of arguments"
+      fi;
+      ;;
+    *)
+      error "argument does not exist";
+      exit 1;
+      ;;
+  esac;
+fi;
+EOL
+
+chmod +x "${EC2_INSTANCE_FILE}"
+
+# ----------------------
+# Update the Config file
+# ----------------------
+
+echo "Updating the config file..."
+
+TMP=".aws2"
+awk -v n=16 -v s="EC2_INSTANCE_URL=\"${instanceUrl}\"" 'NR==n {print s} {print}' "$EC2_LOCAL_CONFIG_FILE" > "$TMP"
+mv "$TMP" "$EC2_LOCAL_CONFIG_FILE"
+
+# -------------------------
+# Output Instance variables
+# -------------------------
+
+echo
+echo "All done. The instance started."
+echo
+echo "Summary"
+echo "-------"
+echo "Name..............: ${EC2_NAME}"
+echo "Region............: ${EC2_REGION}"
+echo "Instance type.....: ${EC2_INSTANCE_TYPE}"
+echo "Image Id..........: ${EC2_IMAGE_ID}"
+echo "Instance Id.......: ${instanceId}"
+echo "Alloc Address.....: ${allocAddr}"
+echo "Assoc Id..........: ${assocId}"
+echo "Instance Url......: ${instanceUrl}"
+echo
+echo "Instance script...: $( basename "${EC2_INSTANCE_FILE}" )"

@@ -1,0 +1,14 @@
+*.log
+.DS_Store
+._*
+*~
+.Spotlight*
+.Trashes
+
+.env
+data/*
+
+.aws
+instance*
+!InstanceTypes*
+delete-vpc*

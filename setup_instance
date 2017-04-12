@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+
+# -----
+# Tests
+# -----
+
+# Test availability of aws-cli
+hash aws 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "'aws' command line tool required, but not installed. Aborting." 1>&2;
+    exit 1;
+fi;
+
+# Test availability of the AWS AccessKey
+if [ -z "$(aws configure get aws_access_key_id)" ]; then
+    echo "AWS credentials not configured. Aborting.";
+    exit 1;
+fi;
+
+# -----------------------
+# Variables and functions
+# -----------------------
+
+# Binaries
+BIN_NAME="$( basename "$0" )"
+
+# Directories
+export EC2_STARTER_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+export WORKING_DIR="$( pwd )"
+
+# Files
+CONFIG_FILE=".aws"
+export EC2_LOCAL_CONFIG_FILE="${WORKING_DIR}/${CONFIG_FILE}"
+CREATE_VPC="${EC2_STARTER_DIR}/create_vpc"
+
+# Defaults
+DEFAULTS=false
+export NAME="eakl"
+export REGION="$( aws configure get region )"
+export INSTANCE_TYPE="t2.micro"
+export IMAGE_ID="ami-405f7226"
+export VOLUME_NAME="${NAME}-volume"
+export DEVICE_NAME="/dev/sda1"
+export VOLUME_SIZE=0
+export VOLUME_TYPE="gp2"
+export VOLUME_DELETE="true"
+export USER_DATA=""
+
+# Flags
+export is_size=""
+export is_del=""
+export is_data=""
+
+# Functions
+error() {
+  echo "error: $1"
+  echo "To get help, run --help"
+  exit 1;
+}
+
+help_opt() {
+  echo -e "usage: $BIN_NAME <command>"
+  echo
+  echo -e "commands:"
+  echo -e "   --help                            Get help"
+  echo
+  echo -e "   --defaults                        Apply default options"
+  echo
+  echo -e "   --name <text>                     Name of VPC and Instance (eakl)"
+  echo -e "   --region <type>                   Region of the VPC and Instance (eu-west-1)"
+  echo -e "   --instance-type <type>            Instance type (t2.micro)"
+  echo -e "   --image-id <id>                   AMI id (ami-405f7226)"
+  echo -e "   --volume-name <text>              Name of the EBS volume (eakl)"
+  echo -e "   --device-name <path_name>         Path of the device (/dev/sda1)"
+  echo -e "   --volume-size <num>               Size of the EBS volume in GB (0)"
+  echo -e "   --volume-type <type>              Type of the volume (gp2)"
+  echo -e "   --delete-on-termination <bool>    Delete volume on termination (true)"
+  echo -e "   --user-data <file_name>           Script executed at instance startup (startup_data.txt)"
+  echo
+}
+
+# -----------------
+# Parsing arguments
+# -----------------
+
+# Are --defaults called
+for args in "$@"; do
+  [[ $args == "--defaults" ]] && DEFAULTS=true && break;
+done;
+
+# Read the input arguments
+if [[ $# -eq 0 ]]; then
+  help_opt;
+  exit 0;
+elif [[ $# -eq 1 && "$DEFAULTS" == "true" ]]; then
+  echo "Applying defaults..."
+else
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -h | --help)
+        help_opt;
+        exit 0;
+        ;;
+      --defaults)
+        error "--defaults should be called alone"
+        ;;
+      --name)
+        if [[ -n "$2" && "$2" =~ ^[[:alnum:]]+ ]]; then
+          NAME_INPUT="$2"
+        else
+          error "wrong format for $1"
+        fi;
+        shift; # pass argument
+        ;;
+      --region)
+        if [[ -n "$2" && "$2" =~ ^[[:alpha:]]{2}\-[[:alpha:]]+\-[[:digit:]]{1} ]]; then
+          REGION_INPUT="$2"
+        else
+          error "wrong format for $1"
+        fi;
+        shift; # pass argument
+        ;;
+      --instance-type)
+        if [[ -n "$2" && "$2" =~ ^[[:alpha:]]{1}[[:digit:]]{1}\.[[:alnum:]]+ ]]; then
+          INSTANCE_TYPE_INPUT="$2"
+        else
+          error "wrong format for $1"
+        fi;
+        shift; # pass argument
+        ;;
+      --image-id)
+        if [[ -n "$2" && "$2" =~ ^ami\-[[:alnum:]]+ ]]; then
+          IMAGE_ID_INPUT="$2"
+        else
+          error "wrong format for $1"
+        fi;
+        shift; # pass argument
+        ;;
+      --volume-name)
+        if [[ -n "$2" && "$2" =~ ^([[:alnum:]][-_]?)+$ ]]; then
+          VOLUME_NAME_INPUT="$2"
+        else
+          error "wrong format for $1"
+        fi;
+        shift; # pass argument
+        ;;
+      --device-name)
+        if [[ -n "$2" && "$2" =~ ^(\/[^ \/.]*[[:alnum:]]+)+$ ]]; then
+          DEVICE_NAME_INPUT="$2"
+        else
+          error "wrong format for $1"
+        fi;
+        shift; # pass argument
+        ;;
+      --volume-size)
+        if [[ -n "$2" && "$2" =~ ^[[:digit:]]+ ]]; then
+          VOLUME_SIZE_INPUT="$2"
+        else
+          error "wrong format for $1"
+        fi;
+        shift; # pass argument
+        ;;
+      --volume-type)
+        if [[ -n "$2" && "$2" =~ ^[[:alnum:]]+ ]]; then
+          VOLUME_TYPE_INPUT="$2"
+        else
+          error "wrong format for $1"
+        fi;
+        shift; # pass argument
+        ;;
+      --delete-on-termination)
+        if [[ -n "$2" && "$2" =~ true|false ]]; then
+          VOLUME_DELETE_INPUT="$2"
+        else
+          error "wrong format for $1"
+        fi;
+        shift; # pass argument
+        ;;
+      --user-data)
+        if [[ -n "$2" && -f "$2" ]]; then
+          USER_DATA_INPUT="$2"
+        else
+          error "wrong format for $1"
+        fi;
+        shift; # pass argument
+        ;;
+      *)
+        error "unknown option: $1"
+        ;;
+    esac;
+    shift; # pass argument or value
+  done;
+fi;
+
+# -------------------------
+# Setting the configuration
+# -------------------------
+
+# Apply defaults and flags
+[[ -n "$NAME_INPUT" ]] && NAME="$NAME_INPUT"
+[[ -n "$REGION_INPUT" ]] && REGION="$REGION_INPUT"
+[[ -n "$INSTANCE_TYPE_INPUT" ]] && INSTANCE_TYPE="$INSTANCE_TYPE_INPUT"
+[[ -n "$IMAGE_ID_INPUT" ]] && IMAGE_ID="$IMAGE_ID_INPUT"
+
+if [[ "$VOLUME_SIZE_INPUT" -gt 0 ]]; then
+  VOLUME_SIZE="$VOLUME_SIZE_INPUT"
+  is_size="-${VOLUME_SIZE_INPUT}gb"
+
+  [[ -n "$VOLUME_NAME_INPUT" ]] && VOLUME_NAME="$VOLUME_NAME_INPUT"
+  [[ -n "$DEVICE_NAME_INPUT" ]] && DEVICE_NAME="$DEVICE_NAME_INPUT"
+  [[ -n "$VOLUME_TYPE_INPUT" ]] && VOLUME_TYPE="$VOLUME_TYPE_INPUT"
+  [[ -n "$VOLUME_DELETE_INPUT" ]] && VOLUME_DELETE="$VOLUME_DELETE_INPUT"
+  [[ "$VOLUME_DELETE" == "true" ]] && is_del="-delete"
+
+  # Update volume name
+  VOLUME_NAME="$( echo "$VOLUME_NAME" | sed -E 's/-+((volume).*)?$//' )-volume${is_size}${is_del}"
+else
+  VOLUME_SIZE=0
+  VOLUME_NAME=""
+  DEVICE_NAME=""
+  VOLUME_TYPE=""
+  VOLUME_DELETE=""
+fi;
+
+[[ -n "$USER_DATA_INPUT" ]] && USER_DATA="$USER_DATA_INPUT" && is_data="-with-data"
+
+# Test if user data file exists
+[[ -n "$USER_DATA" && ! -f "${WORKING_DIR}/${USER_DATA}" ]] && { error "${USER_DATA}: No such file"; exit 1; }
+
+# ----------------------------
+# Validating the configuration
+# ----------------------------
+
+# Configuration
+cat <<EOF
+The instance will be configured with the following options:
+
+Name.............: ${NAME}
+Region...........: ${REGION}
+Instance Type....: ${INSTANCE_TYPE}
+Image Id.........: ${IMAGE_ID}
+
+Volume Name......: ${VOLUME_NAME}
+Device Name......: ${DEVICE_NAME}
+Volume Size......: ${VOLUME_SIZE}
+Volume Type......: ${VOLUME_TYPE}
+Delete Volume....: ${VOLUME_DELETE}
+
+User Data........: ${USER_DATA}
+
+EOF
+
+# User input validation
+read -p "Do you want to continue? (y/n [n]) " -r
+
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+  echo "Aborted";
+  exit 0;
+fi;
+
+echo
+
+# ----------------
+# Creating the VPC
+# ----------------
+
+# Sourcing the create_vpc file
+source "$CREATE_VPC"
+
+# -----------------------------
+# Saving the configuration file
+# -----------------------------
+
+if [[ "$VOLUME_SIZE" -eq 0 ]]; then
+  VOLUME_NAME=""
+  DEVICE_NAME=""
+  VOLUME_TYPE=""
+  VOLUME_DELETE=""
+fi;
+
+# Saving the config file
+cat > $EC2_LOCAL_CONFIG_FILE <<EOL
+# Instance Name
+EC2_NAME="${NAME}"
+EC2_REGION="${REGION}"
+
+# VPC Config
+EC2_VPC_ID="${vpcId}"
+EC2_SUBNET_ID="${subnetId}"
+EC2_INTERNET_GATEWAY_ID="${internetGatewayId}"
+EC2_ROUTE_TABLE_ID="${routeTableId}"
+EC2_ROUTE_TABLE_ASSOC="${routeTableAssoc}"
+EC2_SECURITY_GROUP_ID="${securityGroupId}"
+
+# Instance Config
+EC2_INSTANCE_TYPE="${INSTANCE_TYPE}"
+EC2_IMAGE_ID="${IMAGE_ID}"
+
+# Volume Config
+EC2_VOLUME_NAME="${VOLUME_NAME}"
+EC2_DEVICE_NAME="${DEVICE_NAME}"
+EC2_VOLUME_SIZE=$VOLUME_SIZE
+EC2_VOLUME_TYPE="${VOLUME_TYPE}"
+EC2_VOLUME_DELETE="${VOLUME_DELETE}"
+
+# Startup Script
+EC2_USER_DATA="${USER_DATA}"
+
+# Key
+EC2_KEY_PAIR="${KEY_PAIR}"
+EOL
+
+echo "Config file...........: $( basename "${EC2_LOCAL_CONFIG_FILE}" )"
+echo
+echo "Done. You can now create the instance";

@@ -1,0 +1,64 @@
+# This script is designed to work with ubuntu 16.04 LTS
+
+# Ensure system is updated and has basic build tools
+sudo apt-get update
+sudo apt-get --yes upgrade
+sudo apt-get --yes install tmux build-essential gcc g++ make binutils software-properties-common
+sudo apt-get --yes dist-upgrade
+
+# Install Miniconda
+mkdir ~/downloads
+cd ~/downloads
+wget "https://repo.continuum.io/miniconda/Miniconda3-latest-Linux-x86_64.sh" -O "Miniconda3-latest-Linux-x86_64.sh"
+bash "Miniconda3-latest-Linux-x86_64.sh" -b
+
+# Activate Miniconda
+echo "export PATH=\"$HOME/miniconda3/bin:\$PATH\"" >> ~/.bashrc
+export PATH="$HOME/miniconda3/bin:$PATH"
+source ~/.bashrc
+
+conda update -y conda
+conda upgrade -y --all
+
+conda config --add channels distributions
+conda config --add channels conda-forge
+conda config --add channels defaults
+
+conda config --add create_default_packages pandas
+conda config --add create_default_packages scipy
+conda config --add create_default_packages numpy
+conda config --add create_default_packages pip
+
+conda config --set changeps1 true
+conda config --set show_channel_urls true
+
+mkdir ~/project
+cd ~/project
+
+conda create -n project python=3.5 --yes
+source activate project
+conda install --name project tensorflow=1.0.1 jupyter matplotlib scikit-learn --yes
+
+# install and configure keras
+conda install --name project keras=2.0.2 --yes
+mkdir ~/.keras
+echo '{
+  "epsilon": 1e-07,
+  "floatx": "float32",
+  "backend": "tensorflow",
+  "image_dim_ordering": "tf"
+}' > ~/.keras/keras.json
+
+# configure jupyter and prompt for password
+jupyter notebook --generate-config
+jupypass=$( python -c "from notebook.auth import passwd; print(passwd())" )
+echo "c.NotebookApp.password = u'"$jupypass"'" >> $HOME/.jupyter/jupyter_notebook_config.py
+echo "c.NotebookApp.ip = '*'" >> $HOME/.jupyter/jupyter_notebook_config.py
+echo "c.NotebookApp.open_browser = False" >> $HOME/.jupyter/jupyter_notebook_config.py
+
+echo "alias jupy=\"jupyter notebook --port 9999\"" >> ~/.bashrc
+source ~/.bashrc
+source activate project
+
+echo "\"jupy\" will start Jupyter on port 9999"
+echo "If you get an error instead, try restarting your session so your \$PATH is updated"

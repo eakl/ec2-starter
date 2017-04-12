@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+
+# Variables
+BIN_NAME="$( basename "$0" )"
+AWS_CONFIG_DIR="${CONFIG}/aws"
+
+# Functions
+error() {
+  echo "error: $1"
+  echo "To get help, run --help"
+  exit 1;
+}
+
+help_opt() {
+  echo -e "usage: $BIN_NAME <command>"
+  echo
+  echo -e "commands:"
+  echo -e "   --show                  Show Key Pairs"
+  echo -e "   --delete <key_name>     Delete <key_name>"
+  echo
+}
+
+# Read arguments
+if [[ $# -gt 2 ]]; then
+  error "too many arguments"
+else
+  case $1 in
+    "" | "-h" | "--help")
+      help_opt;
+      exit 0;
+      ;;
+    --show)
+      if [[ -n "$2" ]]; then
+        error "too many argument"
+      else
+        echo "Private Keys (file system)"
+        echo "--------------------------"
+        echo "$( cd "${AWS_CONFIG_DIR}" && find . -type f -iname "*key*" )"
+        echo
+        echo "Public Keys (AWS)"
+        echo "-----------------"
+        aws ec2 describe-key-pairs --key-names --output text
+        echo
+      fi;
+      ;;
+    --delete)
+      if [[ -z "$2" ]]; then
+        error "too few arguments"
+      else
+        KEY_NAME="$2"
+        if [[ -f "${AWS_CONFIG_DIR}/${KEY_NAME}.pem" ]]; then
+          rmtrash "${AWS_CONFIG_DIR}/${KEY_NAME}.pem" #1>/dev/null
+          echo "success: '${KEY_NAME}.pem' has been deleted from your file system"
+        else
+          echo "fail: '${KEY_NAME}.pem' doesn't exist on your file system"
+        fi;
+
+        if [[ "$( aws ec2 describe-key-pairs --key-names "${KEY_NAME}" --output text 2>/dev/null )" =~ ^KEYPAIRS ]]; then
+          aws ec2 delete-key-pair --key-name "$KEY_NAME"
+          echo "success: '${KEY_NAME}' has been deleted on AWS"
+        else
+          echo "fail: '${KEY_NAME}' doesn't exist on AWS"
+        fi;
+      fi;
+      ;;
+    *)
+      error "invalid option"
+      ;;
+  esac;
+fi;
